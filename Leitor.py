@@ -28,9 +28,38 @@ from tkinter import font as tkfont, messagebox, scrolledtext, ttk
 # Evita conflito entre o dialogo nativo do Windows e a inicializacao padrao do pywinauto.
 sys.coinit_flags = 2
 
-USER32_BLOQUEIO_ENTRADA = ctypes.WinDLL("user32", use_last_error=True)
-USER32_BLOQUEIO_ENTRADA.BlockInput.argtypes = [wintypes.BOOL]
-USER32_BLOQUEIO_ENTRADA.BlockInput.restype = wintypes.BOOL
+USER32_ENTRADA = ctypes.WinDLL("user32", use_last_error=True)
+KERNEL32_ENTRADA = ctypes.WinDLL("kernel32", use_last_error=True)
+HHOOK = wintypes.HANDLE
+ULONG_PTR = ctypes.c_size_t
+LOWLEVELPROC = ctypes.WINFUNCTYPE(wintypes.LPARAM, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+USER32_ENTRADA.SetWindowsHookExW.argtypes = [ctypes.c_int, LOWLEVELPROC, wintypes.HINSTANCE, wintypes.DWORD]
+USER32_ENTRADA.SetWindowsHookExW.restype = HHOOK
+USER32_ENTRADA.UnhookWindowsHookEx.argtypes = [HHOOK]
+USER32_ENTRADA.UnhookWindowsHookEx.restype = wintypes.BOOL
+USER32_ENTRADA.CallNextHookEx.argtypes = [HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+USER32_ENTRADA.CallNextHookEx.restype = wintypes.LPARAM
+USER32_ENTRADA.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, ctypes.c_uint, ctypes.c_uint]
+USER32_ENTRADA.GetMessageW.restype = ctypes.c_int
+USER32_ENTRADA.PeekMessageW.argtypes = [
+    ctypes.POINTER(wintypes.MSG),
+    wintypes.HWND,
+    ctypes.c_uint,
+    ctypes.c_uint,
+    ctypes.c_uint,
+]
+USER32_ENTRADA.PeekMessageW.restype = wintypes.BOOL
+USER32_ENTRADA.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+USER32_ENTRADA.TranslateMessage.restype = wintypes.BOOL
+USER32_ENTRADA.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+USER32_ENTRADA.DispatchMessageW.restype = wintypes.LPARAM
+USER32_ENTRADA.PostThreadMessageW.argtypes = [wintypes.DWORD, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+USER32_ENTRADA.PostThreadMessageW.restype = wintypes.BOOL
+KERNEL32_ENTRADA.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+KERNEL32_ENTRADA.GetModuleHandleW.restype = wintypes.HINSTANCE
+KERNEL32_ENTRADA.GetCurrentThreadId.argtypes = []
+KERNEL32_ENTRADA.GetCurrentThreadId.restype = wintypes.DWORD
 
 try:
     import win32api
@@ -224,6 +253,21 @@ TEMPO_LIMITE_ABERTURA_INTERFACE = 300
 TEMPO_ESPERA_FECHAMENTO_INTERFACE = 3
 TEMPO_ESPERA_REACAO_FECHAMENTO = 1.0
 TEMPO_LIMITE_LOCALIZAR_CANCELAR = 20
+WH_KEYBOARD_LL = 13
+WH_MOUSE_LL = 14
+HC_ACTION = 0
+WM_QUIT = 0x0012
+WM_KEYDOWN = 0x0100
+WM_KEYUP = 0x0101
+WM_SYSKEYDOWN = 0x0104
+WM_SYSKEYUP = 0x0105
+PM_NOREMOVE = 0x0000
+VK_LCONTROL = 0xA2
+VK_RCONTROL = 0xA3
+VK_U = ord("U")
+VK_L = ord("L")
+LLKHF_INJECTED = 0x0010
+LLMHF_INJECTED = 0x0001
 
 
 def pasta_recursos() -> Path:
@@ -433,33 +477,270 @@ def acao_requer_elevacao(acao: str) -> bool:
     return acao in {"gui", "preparar", "restaurar", "atualizar"}
 
 
-def alterar_bloqueio_entrada_usuario(bloquear: bool) -> None:
-    ctypes.set_last_error(0)
-    if USER32_BLOQUEIO_ENTRADA.BlockInput(bool(bloquear)):
-        return
+class EstruturaGanchoTeclado(ctypes.Structure):
+    _fields_ = [
+        ("vkCode", wintypes.DWORD),
+        ("scanCode", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
 
-    codigo = ctypes.get_last_error()
-    acao = "bloquear" if bloquear else "liberar"
-    detalhe = ctypes.FormatError(codigo).strip() if codigo else "retorno inesperado do Windows"
-    raise RuntimeError(f"Nao foi possivel {acao} teclado e mouse: {detalhe}.")
+
+class EstruturaGanchoMouse(ctypes.Structure):
+    _fields_ = [
+        ("pt", wintypes.POINT),
+        ("mouseData", wintypes.DWORD),
+        ("flags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ULONG_PTR),
+    ]
+
+
+class GerenciadorBloqueioEntrada:
+    def __init__(
+        self,
+        logger: Callable[[str], None] | None = None,
+        contexto: str = "a automacao",
+        permitir_atalhos: bool = True,
+    ) -> None:
+        self.logger = logger
+        self.contexto = contexto
+        self.permitir_atalhos = permitir_atalhos
+        self._bloqueado = True
+        self._lock_estado = threading.Lock()
+        self._controles_pressionados: set[int] = set()
+        self._teclas_suprimidas: set[int] = set()
+        self._evento_iniciado = threading.Event()
+        self._erro_inicializacao: Exception | None = None
+        self._thread: threading.Thread | None = None
+        self._thread_id = 0
+        self._gancho_teclado: int | None = None
+        self._gancho_mouse: int | None = None
+        self._proc_teclado = None
+        self._proc_mouse = None
+
+    @staticmethod
+    def _eh_tecla_controle(vk_code: int) -> bool:
+        return vk_code in {VK_LCONTROL, VK_RCONTROL}
+
+    def _proximo_gancho(self, n_code: int, wparam: int, lparam: int) -> int:
+        return int(USER32_ENTRADA.CallNextHookEx(None, n_code, wparam, lparam))
+
+    def _definir_bloqueio(self, bloqueado: bool, origem: str | None = None) -> None:
+        mensagem: str | None = None
+        with self._lock_estado:
+            alterou = self._bloqueado != bool(bloqueado)
+            self._bloqueado = bool(bloqueado)
+            if not alterou:
+                return
+
+            if self._bloqueado:
+                mensagem = "Teclado e mouse bloqueados novamente."
+            else:
+                mensagem = "Teclado e mouse liberados temporariamente."
+
+            if origem:
+                mensagem = f"{origem} {mensagem}"
+
+        if mensagem:
+            logar(self.logger, mensagem)
+
+    def iniciar(self, bloqueado_inicial: bool = True) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            self._definir_bloqueio(bloqueado_inicial)
+            return
+
+        with self._lock_estado:
+            self._bloqueado = bool(bloqueado_inicial)
+            self._controles_pressionados.clear()
+            self._teclas_suprimidas.clear()
+
+        self._evento_iniciado.clear()
+        self._erro_inicializacao = None
+        self._thread = threading.Thread(
+            target=self._executar_loop_ganchos,
+            name="controle-entrada-global",
+            daemon=True,
+        )
+        self._thread.start()
+
+        if not self._evento_iniciado.wait(timeout=5):
+            raise RuntimeError("Tempo esgotado ao iniciar o controle global de teclado e mouse.")
+        if self._erro_inicializacao is not None:
+            raise RuntimeError(
+                "Nao foi possivel iniciar o controle global de teclado e mouse."
+            ) from self._erro_inicializacao
+
+        if self.permitir_atalhos:
+            logar(self.logger, f"Teclado e mouse iniciados como bloqueados durante {self.contexto}.")
+            logar(self.logger, "Atalhos disponiveis: Ctrl+U libera temporariamente e Ctrl+L bloqueia novamente.")
+        else:
+            logar(self.logger, f"Bloqueio total de teclado e mouse iniciado durante {self.contexto}.")
+
+    def encerrar(self) -> None:
+        with self._lock_estado:
+            self._bloqueado = False
+            self._controles_pressionados.clear()
+            self._teclas_suprimidas.clear()
+
+        thread_id = self._thread_id
+        thread = self._thread
+        if thread_id:
+            USER32_ENTRADA.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+        if thread is not None:
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logar(self.logger, "Aviso: a thread de controle global de entrada demorou para encerrar.")
+
+        self._thread = None
+        self._thread_id = 0
+        logar(self.logger, "Teclado e mouse liberados.")
+
+    def _executar_loop_ganchos(self) -> None:
+        try:
+            self._thread_id = int(KERNEL32_ENTRADA.GetCurrentThreadId())
+            modulo = KERNEL32_ENTRADA.GetModuleHandleW(None)
+            self._proc_teclado = LOWLEVELPROC(self._callback_teclado)
+            self._proc_mouse = LOWLEVELPROC(self._callback_mouse)
+
+            ctypes.set_last_error(0)
+            self._gancho_teclado = USER32_ENTRADA.SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                self._proc_teclado,
+                modulo,
+                0,
+            )
+            if not self._gancho_teclado:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            ctypes.set_last_error(0)
+            self._gancho_mouse = USER32_ENTRADA.SetWindowsHookExW(
+                WH_MOUSE_LL,
+                self._proc_mouse,
+                modulo,
+                0,
+            )
+            if not self._gancho_mouse:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            mensagem = wintypes.MSG()
+            USER32_ENTRADA.PeekMessageW(ctypes.byref(mensagem), None, 0, 0, PM_NOREMOVE)
+            self._evento_iniciado.set()
+
+            while True:
+                resultado = int(USER32_ENTRADA.GetMessageW(ctypes.byref(mensagem), None, 0, 0))
+                if resultado == -1:
+                    raise ctypes.WinError(ctypes.get_last_error())
+                if resultado == 0:
+                    break
+                USER32_ENTRADA.TranslateMessage(ctypes.byref(mensagem))
+                USER32_ENTRADA.DispatchMessageW(ctypes.byref(mensagem))
+        except Exception as exc:  # noqa: BLE001
+            if not self._evento_iniciado.is_set():
+                self._erro_inicializacao = exc
+            else:
+                logar(self.logger, f"Aviso: o controle global de entrada foi encerrado por erro: {exc}")
+        finally:
+            self._desinstalar_ganchos()
+            self._thread_id = 0
+            self._evento_iniciado.set()
+
+    def _desinstalar_ganchos(self) -> None:
+        for atributo in ("_gancho_mouse", "_gancho_teclado"):
+            gancho = getattr(self, atributo)
+            if gancho:
+                USER32_ENTRADA.UnhookWindowsHookEx(gancho)
+                setattr(self, atributo, None)
+        self._proc_teclado = None
+        self._proc_mouse = None
+
+    def _callback_teclado(self, n_code: int, wparam: int, lparam: int) -> int:
+        if n_code != HC_ACTION:
+            return self._proximo_gancho(n_code, wparam, lparam)
+
+        dados = ctypes.cast(lparam, ctypes.POINTER(EstruturaGanchoTeclado)).contents
+        if int(dados.flags) & LLKHF_INJECTED:
+            return self._proximo_gancho(n_code, wparam, lparam)
+
+        vk_code = int(dados.vkCode)
+        mensagem = int(wparam)
+        tecla_pressionada = mensagem in {WM_KEYDOWN, WM_SYSKEYDOWN}
+        tecla_solta = mensagem in {WM_KEYUP, WM_SYSKEYUP}
+        bloquear_evento = False
+        log_atalho: str | None = None
+
+        with self._lock_estado:
+            if not self.permitir_atalhos:
+                if self._bloqueado:
+                    return 1
+                return self._proximo_gancho(n_code, wparam, lparam)
+
+            if tecla_pressionada and self._eh_tecla_controle(vk_code):
+                self._controles_pressionados.add(vk_code)
+            elif tecla_solta and self._eh_tecla_controle(vk_code):
+                self._controles_pressionados.discard(vk_code)
+
+            ctrl_ativo = bool(self._controles_pressionados)
+
+            if tecla_pressionada and ctrl_ativo and vk_code == VK_U:
+                self._teclas_suprimidas.add(vk_code)
+                bloquear_evento = True
+                if self._bloqueado:
+                    self._bloqueado = False
+                    log_atalho = "Atalho Ctrl+U recebido."
+            elif tecla_pressionada and ctrl_ativo and vk_code == VK_L:
+                self._teclas_suprimidas.add(vk_code)
+                bloquear_evento = True
+                if not self._bloqueado:
+                    self._bloqueado = True
+                    log_atalho = "Atalho Ctrl+L recebido."
+            elif vk_code in self._teclas_suprimidas:
+                bloquear_evento = True
+                if tecla_solta:
+                    self._teclas_suprimidas.discard(vk_code)
+            elif self._eh_tecla_controle(vk_code):
+                bloquear_evento = True
+            elif self._bloqueado:
+                bloquear_evento = True
+
+        if log_atalho == "Atalho Ctrl+U recebido.":
+            logar(self.logger, f"{log_atalho} Teclado e mouse liberados temporariamente.")
+        elif log_atalho == "Atalho Ctrl+L recebido.":
+            logar(self.logger, f"{log_atalho} Teclado e mouse bloqueados novamente.")
+
+        if bloquear_evento:
+            return 1
+        return self._proximo_gancho(n_code, wparam, lparam)
+
+    def _callback_mouse(self, n_code: int, wparam: int, lparam: int) -> int:
+        if n_code != HC_ACTION:
+            return self._proximo_gancho(n_code, wparam, lparam)
+
+        dados = ctypes.cast(lparam, ctypes.POINTER(EstruturaGanchoMouse)).contents
+        if int(dados.flags) & LLMHF_INJECTED:
+            return self._proximo_gancho(n_code, wparam, lparam)
+
+        with self._lock_estado:
+            bloqueado = self._bloqueado
+
+        if bloqueado:
+            return 1
+        return self._proximo_gancho(n_code, wparam, lparam)
 
 
 @contextmanager
 def bloquear_entrada_usuario(
     logger: Callable[[str], None] | None = None,
     contexto: str = "a automacao",
+    permitir_atalhos: bool = True,
 ):
-    logar(logger, f"Bloqueando teclado e mouse durante {contexto}.")
-    alterar_bloqueio_entrada_usuario(True)
+    gerenciador = GerenciadorBloqueioEntrada(logger, contexto, permitir_atalhos=permitir_atalhos)
+    gerenciador.iniciar(bloqueado_inicial=True)
     try:
         yield
     finally:
-        try:
-            alterar_bloqueio_entrada_usuario(False)
-        except Exception as exc:  # noqa: BLE001
-            logar(logger, f"Aviso: nao foi possivel liberar teclado e mouse automaticamente: {exc}")
-        else:
-            logar(logger, "Teclado e mouse liberados.")
+        gerenciador.encerrar()
 
 
 def relancar_como_admin() -> bool:
@@ -1551,7 +1832,12 @@ def automatizar_setup(
     cancelar_evento: threading.Event | None = None,
 ) -> None:
     verificar_cancelamento(cancelar_evento, f"inicio do setup {setup.caminho.name}")
-    with bloquear_entrada_usuario(logger, f"a automacao do setup {setup.caminho.name}"):
+    bloqueio_total = solicitar_caminho_banco_ativo(pasta_interface, logger=logger)
+    with bloquear_entrada_usuario(
+        logger,
+        f"a automacao do setup {setup.caminho.name}",
+        permitir_atalhos=not bloqueio_total,
+    ):
         executavel_interface = localizar_executavel_interface(pasta_interface)
         pids_interface_antes = {processo.pid for processo in coletar_processos_por_caminho(executavel_interface)}
         processo_raiz = subprocess.Popen([str(setup.caminho), *argumentos], cwd=str(setup.caminho.parent))
@@ -1669,6 +1955,76 @@ def coletar_arquivos_ini(pasta_interface: Path) -> list[Path]:
     return arquivos
 
 
+def ler_arquivo_ini(caminho_arquivo: Path) -> configparser.ConfigParser | None:
+    parser = configparser.ConfigParser()
+    parser.optionxform = str
+
+    try:
+        parser.read(caminho_arquivo, encoding="latin-1")
+    except configparser.Error:
+        return None
+    return parser
+
+
+def obter_valor_opcao_ini(
+    parser: configparser.ConfigParser,
+    secao: str,
+    nome_opcao: str,
+) -> str | None:
+    try:
+        opcoes = parser.defaults().keys() if secao == configparser.DEFAULTSECT else parser.options(secao)
+    except (configparser.NoSectionError, configparser.Error):
+        return None
+
+    for opcao in opcoes:
+        if normalizar_nome_arquivo(opcao) == normalizar_nome_arquivo(nome_opcao):
+            try:
+                return parser.get(secao, opcao, fallback="").strip()
+            except configparser.Error:
+                return None
+    return None
+
+
+def solicitar_caminho_banco_ativo(
+    pasta_interface: Path,
+    logger: Callable[[str], None] | None = None,
+) -> bool:
+    arquivos_ini = coletar_arquivos_ini(pasta_interface)
+    if not arquivos_ini:
+        return False
+
+    arquivos_ordenados = sorted(
+        arquivos_ini,
+        key=lambda caminho: (
+            caminho.name.casefold() != "config.ini",
+            str(caminho).casefold(),
+        ),
+    )
+
+    for arquivo_ini in arquivos_ordenados:
+        parser = ler_arquivo_ini(arquivo_ini)
+        if parser is None:
+            continue
+
+        secoes = [configparser.DEFAULTSECT, *parser.sections()]
+        for secao in secoes:
+            valor = obter_valor_opcao_ini(parser, secao, "Solicitar_Caminho_Banco")
+            if valor is None:
+                continue
+
+            ativo = normalizar_nome_arquivo(valor) in {"s", "sim", "1", "true", "yes"}
+            if ativo:
+                origem = arquivo_ini.name if secao == configparser.DEFAULTSECT else f"{arquivo_ini.name} [{secao}]"
+                logar(
+                    logger,
+                    "Config detectado com Solicitar_Caminho_Banco=S; "
+                    f"o bloqueio total de teclado e mouse sera aplicado ({origem}).",
+                )
+            return ativo
+
+    return False
+
+
 def caminho_banco_deve_ser_ignorado(caminho: Path) -> bool:
     texto_caminho = normalizar_nome_arquivo(str(caminho).replace("\\", " "))
     nome_arquivo = normalizar_nome_arquivo(caminho.name)
@@ -1682,12 +2038,8 @@ def ler_candidatos_dos_ini(arquivos_ini: Iterable[Path]) -> list[BancoCandidato]
     candidatos: list[BancoCandidato] = []
 
     for arquivo_ini in arquivos_ini:
-        parser = configparser.ConfigParser()
-        parser.optionxform = str
-
-        try:
-            parser.read(arquivo_ini, encoding="latin-1")
-        except configparser.Error:
+        parser = ler_arquivo_ini(arquivo_ini)
+        if parser is None:
             continue
 
         for secao in parser.sections():
@@ -3837,7 +4189,9 @@ class AtualizadorInterfaceApp(tk.Tk):
                 "A atualizacao vai preparar a base e executar todo o fluxo automaticamente: "
                 "instalador, enters, conclusao, abertura da Interface e fechamento para seguir "
                 "para a proxima versao, restauracao do nome original da base e correcao final da grid. "
-                "Durante a automacao de cada setup, teclado e mouse ficarao bloqueados para evitar interferencias. "
+                "Durante a automacao de cada setup, teclado e mouse comecam bloqueados para evitar interferencias. "
+                "Se o config.ini estiver com Solicitar_Caminho_Banco=S, o bloqueio sera total. "
+                "Nos demais casos, use Ctrl+U para liberar temporariamente e Ctrl+L para bloquear novamente. "
                 "Deseja continuar?"
             ),
         ):

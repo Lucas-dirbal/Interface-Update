@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import unicodedata
+from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -26,6 +27,10 @@ from tkinter import font as tkfont, messagebox, scrolledtext, ttk
 
 # Evita conflito entre o dialogo nativo do Windows e a inicializacao padrao do pywinauto.
 sys.coinit_flags = 2
+
+USER32_BLOQUEIO_ENTRADA = ctypes.WinDLL("user32", use_last_error=True)
+USER32_BLOQUEIO_ENTRADA.BlockInput.argtypes = [wintypes.BOOL]
+USER32_BLOQUEIO_ENTRADA.BlockInput.restype = wintypes.BOOL
 
 try:
     import win32api
@@ -426,6 +431,35 @@ def usuario_e_admin() -> bool:
 
 def acao_requer_elevacao(acao: str) -> bool:
     return acao in {"gui", "preparar", "restaurar", "atualizar"}
+
+
+def alterar_bloqueio_entrada_usuario(bloquear: bool) -> None:
+    ctypes.set_last_error(0)
+    if USER32_BLOQUEIO_ENTRADA.BlockInput(bool(bloquear)):
+        return
+
+    codigo = ctypes.get_last_error()
+    acao = "bloquear" if bloquear else "liberar"
+    detalhe = ctypes.FormatError(codigo).strip() if codigo else "retorno inesperado do Windows"
+    raise RuntimeError(f"Nao foi possivel {acao} teclado e mouse: {detalhe}.")
+
+
+@contextmanager
+def bloquear_entrada_usuario(
+    logger: Callable[[str], None] | None = None,
+    contexto: str = "a automacao",
+):
+    logar(logger, f"Bloqueando teclado e mouse durante {contexto}.")
+    alterar_bloqueio_entrada_usuario(True)
+    try:
+        yield
+    finally:
+        try:
+            alterar_bloqueio_entrada_usuario(False)
+        except Exception as exc:  # noqa: BLE001
+            logar(logger, f"Aviso: nao foi possivel liberar teclado e mouse automaticamente: {exc}")
+        else:
+            logar(logger, "Teclado e mouse liberados.")
 
 
 def relancar_como_admin() -> bool:
@@ -1517,103 +1551,104 @@ def automatizar_setup(
     cancelar_evento: threading.Event | None = None,
 ) -> None:
     verificar_cancelamento(cancelar_evento, f"inicio do setup {setup.caminho.name}")
-    executavel_interface = localizar_executavel_interface(pasta_interface)
-    pids_interface_antes = {processo.pid for processo in coletar_processos_por_caminho(executavel_interface)}
-    processo_raiz = subprocess.Popen([str(setup.caminho), *argumentos], cwd=str(setup.caminho.parent))
-    pids_monitorados: set[int] = {processo_raiz.pid}
-    logar(logger, f"Setup iniciado com PID {processo_raiz.pid}.")
+    with bloquear_entrada_usuario(logger, f"a automacao do setup {setup.caminho.name}"):
+        executavel_interface = localizar_executavel_interface(pasta_interface)
+        pids_interface_antes = {processo.pid for processo in coletar_processos_por_caminho(executavel_interface)}
+        processo_raiz = subprocess.Popen([str(setup.caminho), *argumentos], cwd=str(setup.caminho.parent))
+        pids_monitorados: set[int] = {processo_raiz.pid}
+        logar(logger, f"Setup iniciado com PID {processo_raiz.pid}.")
 
-    def atualizar_pids() -> list[int]:
-        pids_monitorados.update(coletar_pids_relacionados(pids_monitorados))
-        return sorted(pids_monitorados)
+        def atualizar_pids() -> list[int]:
+            pids_monitorados.update(coletar_pids_relacionados(pids_monitorados))
+            return sorted(pids_monitorados)
 
-    try:
-        janela_idioma = aguardar_janela(
-            atualizar_pids,
-            "janela de idioma do instalador",
-            TEMPO_LIMITE_JANELA_INSTALADOR,
-            lambda janela: "selecionar idioma" in normalizar_texto_ui(janela.titulo),
-            cancelar_evento=cancelar_evento,
-        )
-        logar(logger, "Janela de idioma localizada. Confirmando idioma padrao.")
-        if not clicar_botao_por_texto(janela_idioma.handle, ("ok",)):
-            raise RuntimeError("Nao foi possivel confirmar a janela de idioma do instalador.")
+        try:
+            janela_idioma = aguardar_janela(
+                atualizar_pids,
+                "janela de idioma do instalador",
+                TEMPO_LIMITE_JANELA_INSTALADOR,
+                lambda janela: "selecionar idioma" in normalizar_texto_ui(janela.titulo),
+                cancelar_evento=cancelar_evento,
+            )
+            logar(logger, "Janela de idioma localizada. Confirmando idioma padrao.")
+            if not clicar_botao_por_texto(janela_idioma.handle, ("ok",)):
+                raise RuntimeError("Nao foi possivel confirmar a janela de idioma do instalador.")
 
-        janela_principal = aguardar_janela(
-            atualizar_pids,
-            "janela principal do instalador",
-            TEMPO_LIMITE_JANELA_INSTALADOR,
-            lambda janela: janela.classe != "TApplication" and "selecionar idioma" not in normalizar_texto_ui(janela.titulo),
-            cancelar_evento=cancelar_evento,
-        )
-        pressionar_enter_na_janela(
-            janela_principal.handle,
-            ENTERS_POR_SETUP,
-            logger=logger,
-            cancelar_evento=cancelar_evento,
-        )
+            janela_principal = aguardar_janela(
+                atualizar_pids,
+                "janela principal do instalador",
+                TEMPO_LIMITE_JANELA_INSTALADOR,
+                lambda janela: janela.classe != "TApplication" and "selecionar idioma" not in normalizar_texto_ui(janela.titulo),
+                cancelar_evento=cancelar_evento,
+            )
+            pressionar_enter_na_janela(
+                janela_principal.handle,
+                ENTERS_POR_SETUP,
+                logger=logger,
+                cancelar_evento=cancelar_evento,
+            )
 
-        def localizar_janela_conclusao() -> JanelaDetectada | None:
-            for janela in listar_janelas_visiveis(atualizar_pids()):
-                if janela.classe == "TApplication":
-                    continue
+            def localizar_janela_conclusao() -> JanelaDetectada | None:
+                for janela in listar_janelas_visiveis(atualizar_pids()):
+                    if janela.classe == "TApplication":
+                        continue
 
-                controle_checkbox = localizar_controle_por_texto(
-                    janela.handle,
-                    ("executar", "interface", "run"),
-                    classes_permitidas=("check", "button"),
-                )
-                controle_finalizar = localizar_controle_por_texto(
-                    janela.handle,
-                    ("concluir", "finalizar", "finish"),
-                    classes_permitidas=("button",),
-                )
-                if controle_checkbox or controle_finalizar:
-                    return janela
-            return None
+                    controle_checkbox = localizar_controle_por_texto(
+                        janela.handle,
+                        ("executar", "interface", "run"),
+                        classes_permitidas=("check", "button"),
+                    )
+                    controle_finalizar = localizar_controle_por_texto(
+                        janela.handle,
+                        ("concluir", "finalizar", "finish"),
+                        classes_permitidas=("button",),
+                    )
+                    if controle_checkbox or controle_finalizar:
+                        return janela
+                return None
 
-        janela_conclusao = aguardar_condicao(
-            "pagina final do instalador",
-            localizar_janela_conclusao,
-            TEMPO_LIMITE_CONCLUSAO_INSTALADOR,
-            intervalo=1.0,
-            cancelar_evento=cancelar_evento,
-        )
-        assert isinstance(janela_conclusao, JanelaDetectada)
-        logar(logger, "Pagina final do instalador localizada.")
+            janela_conclusao = aguardar_condicao(
+                "pagina final do instalador",
+                localizar_janela_conclusao,
+                TEMPO_LIMITE_CONCLUSAO_INSTALADOR,
+                intervalo=1.0,
+                cancelar_evento=cancelar_evento,
+            )
+            assert isinstance(janela_conclusao, JanelaDetectada)
+            logar(logger, "Pagina final do instalador localizada.")
 
-        if garantir_checkbox_marcado(janela_conclusao.handle, ("executar interface", "interface")):
-            logar(logger, "Opcao para executar a Interface ao final confirmada.")
-        else:
-            logar(logger, "Nao foi possivel confirmar visualmente o checkbox da Interface; seguindo com a finalizacao.")
+            if garantir_checkbox_marcado(janela_conclusao.handle, ("executar interface", "interface")):
+                logar(logger, "Opcao para executar a Interface ao final confirmada.")
+            else:
+                logar(logger, "Nao foi possivel confirmar visualmente o checkbox da Interface; seguindo com a finalizacao.")
 
-        if clicar_botao_por_texto(janela_conclusao.handle, ("concluir", "finalizar", "finish")):
-            logar(logger, "Botao de conclusao acionado.")
-        else:
-            trazer_janela_para_frente(janela_conclusao.handle)
-            enviar_teclas_pywinauto("{ENTER}")
-            logar(logger, "Botao de conclusao nao foi localizado; Enter enviado como alternativa.")
+            if clicar_botao_por_texto(janela_conclusao.handle, ("concluir", "finalizar", "finish")):
+                logar(logger, "Botao de conclusao acionado.")
+            else:
+                trazer_janela_para_frente(janela_conclusao.handle)
+                enviar_teclas_pywinauto("{ENTER}")
+                logar(logger, "Botao de conclusao nao foi localizado; Enter enviado como alternativa.")
 
-        aguardar_condicao(
-            "encerramento do instalador",
-            lambda: all(not psutil.pid_exists(pid) for pid in atualizar_pids()),
-            120,
-            intervalo=1.0,
-            cancelar_evento=cancelar_evento,
-        )
-        logar(logger, "Instalador encerrado.")
+            aguardar_condicao(
+                "encerramento do instalador",
+                lambda: all(not psutil.pid_exists(pid) for pid in atualizar_pids()),
+                120,
+                intervalo=1.0,
+                cancelar_evento=cancelar_evento,
+            )
+            logar(logger, "Instalador encerrado.")
 
-        aguardar_interface_abrir_e_fechar(
-            pasta_interface,
-            pids_anteriores=pids_interface_antes,
-            logger=logger,
-            cancelar_evento=cancelar_evento,
-        )
-    except OperacaoCancelada:
-        logar(logger, f"Parada solicitada durante o setup {setup.caminho.name}.")
-        encerrar_processos_por_pid(atualizar_pids(), "o instalador em execucao", logger=logger)
-        encerrar_processos_interface_restantes(executavel_interface, pids_interface_antes, logger=logger)
-        raise
+            aguardar_interface_abrir_e_fechar(
+                pasta_interface,
+                pids_anteriores=pids_interface_antes,
+                logger=logger,
+                cancelar_evento=cancelar_evento,
+            )
+        except OperacaoCancelada:
+            logar(logger, f"Parada solicitada durante o setup {setup.caminho.name}.")
+            encerrar_processos_por_pid(atualizar_pids(), "o instalador em execucao", logger=logger)
+            encerrar_processos_interface_restantes(executavel_interface, pids_interface_antes, logger=logger)
+            raise
 
 
 def configurar_cliente_firebird(pasta_interface: Path) -> None:
@@ -3802,6 +3837,7 @@ class AtualizadorInterfaceApp(tk.Tk):
                 "A atualizacao vai preparar a base e executar todo o fluxo automaticamente: "
                 "instalador, enters, conclusao, abertura da Interface e fechamento para seguir "
                 "para a proxima versao, restauracao do nome original da base e correcao final da grid. "
+                "Durante a automacao de cada setup, teclado e mouse ficarao bloqueados para evitar interferencias. "
                 "Deseja continuar?"
             ),
         ):

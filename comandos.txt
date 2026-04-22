@@ -1,0 +1,5 @@
+git add . //adiciona tudo ao comit
+git commit -m "Descrição" //para adicionar descrição ao comit
+git push //empurra tudo para a nuvem 
+
+python -m PyInstaller --noconfirm --clean .\InterfaceUpdate.spec //compilar o exe
